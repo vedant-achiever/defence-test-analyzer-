@@ -587,41 +587,69 @@ def _extract_date(ts_value: str) -> str:
     return ts[:10] if len(ts) >= 10 else ts
 
 
-def _extract_minute_key(ts_value: str) -> str:
-    """Extract minute-level key from timestamp for grouping (DD-MM-YYYY HH:MM)."""
+def _extract_30s_key(ts_value: str) -> str:
+    """Extract 30-second bucket key from timestamp for grouping (DD-MM-YYYY HH:MM:SS).
+
+    Seconds are floored to the nearest half-minute boundary (:00 or :30) so the
+    sampled dataset contains exactly one point every 30 seconds.
+    """
     from datetime import datetime
     import re
     ts = str(ts_value).strip()
-    
+
     # Strip trailing colon-separated milliseconds (e.g., "10:02:24:254" -> "10:02:24")
     # Matches HH:MM:SS:mmm pattern at end of string
     ts_clean = re.sub(r'(\d{2}:\d{2}:\d{2}):\d+$', r'\1', ts)
-    
+
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f",
                 "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M",
                 "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S",
                 "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M", "%d-%m-%Y %H:%M"]:
         try:
             dt = datetime.strptime(ts_clean[:26], fmt)
-            # Preserve original DD-MM-YYYY format for consistency
-            return dt.strftime("%d-%m-%Y %H:%M")
+            # Floor to the nearest 30-second boundary (:00 or :30)
+            bucket_dt = dt.replace(second=(dt.second // 30) * 30, microsecond=0)
+            return bucket_dt.strftime("%d-%m-%Y %H:%M:%S")
         except (ValueError, IndexError):
             continue
-    
-    # Fallback: return first 16 chars
+
+    # Fallback: return the first 19 chars (full DD-MM-YYYY HH:MM:SS slice)
+    if len(ts_clean) >= 19:
+        return ts_clean[:19]
     if len(ts) >= 16:
-        return ts[:16]
+        return ts[:16] + ":30"
     return ts
 
 
-def generate_minute_averaged_csv(
+def _parse_bucket_datetime(key: str):
+    """Parse a bucket key such as 'DD-MM-YYYY HH:MM:SS' back into a datetime for
+    chronological sorting. Returns None when the key cannot be parsed."""
+    from datetime import datetime
+
+    key_clean = str(key).strip()
+    for fmt in ["%d-%m-%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"]:
+        try:
+            return datetime.strptime(key_clean, fmt)
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
+def generate_30s_averaged_csv(
     master_csv_path: str,
     averaged_csv_path: str,
     sort_order: str = "asc"
 ) -> List[Dict[str, Any]]:
-    """Read master_combined.csv, group by minute, average numeric columns,
-    add Date column, sort by timestamp, and write to averaged CSV.
-    Returns preview data (first 200 rows) for charting.
+    """Read master_combined.csv, take the FIRST record of every 30-second bucket
+    (no cross-bucket averaging), add Date column, sort by timestamp, and write
+    to averaged CSV. Returns preview data (first 200 rows) for charting.
+
+    Two sampled points are produced per minute (at :00 and :30) so the analysis
+    graph and the final combined CSV carry a value every 30 seconds.
+
+    The actual/raw combined data is never modified — only the 30-second-sampled
+    representation used for analysis/charting is derived here.
     """
     import os
     import csv
@@ -630,14 +658,14 @@ def generate_minute_averaged_csv(
     if not os.path.exists(master_csv_path):
         return []
 
-    # Pass 1: Read header and group rows by minute
+    # Pass 1: Read header and keep only the FIRST record of every 30-second bucket
     grouped = OrderedDict()
     header = []
 
     with open(master_csv_path, 'r', encoding='utf-8', errors='replace') as f:
         reader = csv.DictReader(f)
         header = list(reader.fieldnames or [])
-        
+
         # Ensure Date column exists in header (right after Timestamp)
         if "Date" not in header:
             ts_idx = header.index("Timestamp") if "Timestamp" in header else 1
@@ -645,35 +673,24 @@ def generate_minute_averaged_csv(
 
         for row in reader:
             ts_value = row.get("Timestamp", "")
-            minute_key = _extract_minute_key(ts_value)
-            
-            if minute_key not in grouped:
-                grouped[minute_key] = {
-                    "_count": 0,
-                    "_numeric_sums": {},
-                    "_numeric_counts": {},
+            bucket_key = _extract_30s_key(ts_value)
+
+            if bucket_key not in grouped:
+                # First-value sampling: preserve the raw first record of the bucket
+                grouped[bucket_key] = {
                     "_first_row": dict(row),
                     "_timestamp": ts_value,
                 }
-            
-            group = grouped[minute_key]
-            group["_count"] += 1
-            
-            # Accumulate numeric values for averaging
-            for col, val in row.items():
-                if col in ("id", "Timestamp", "Date", "Source_Row", "Processing_Time"):
-                    continue
-                try:
-                    f_val = float(val)
-                    group["_numeric_sums"][col] = group["_numeric_sums"].get(col, 0.0) + f_val
-                    group["_numeric_counts"][col] = group["_numeric_counts"].get(col, 0) + 1
-                except (ValueError, TypeError):
-                    pass
 
-    # Sort by minute key
-    sorted_keys = sorted(grouped.keys(), reverse=(sort_order == "desc"))
+    # Sort by parsed datetime so across-days chronology is correct
+    fallback_dt = datetime(1970, 1, 1)
+    sorted_keys = sorted(
+        grouped.keys(),
+        key=lambda k: (_parse_bucket_datetime(k) or fallback_dt, k),
+        reverse=(sort_order == "desc"),
+    )
 
-    # Pass 2: Write averaged CSV
+    # Pass 2: Write 30-second-sampled CSV (first record of each bucket)
     os.makedirs(os.path.dirname(averaged_csv_path), exist_ok=True)
     preview = []
     row_idx = 0
@@ -682,28 +699,24 @@ def generate_minute_averaged_csv(
         writer = csv.DictWriter(out_f, fieldnames=header, extrasaction='ignore')
         writer.writeheader()
 
-        for minute_key in sorted_keys:
-            group = grouped[minute_key]
-            count = group["_count"]
-            first_row = group["_first_row"]
-            
+        for bucket_key in sorted_keys:
+            first_row = grouped[bucket_key]["_first_row"]
+
             out_row = {}
             for col in header:
                 col_lower = col.lower()
                 if col == "id":
-                    out_row[col] = f"avg_{row_idx + 1}"
+                    out_row[col] = f"ts30_{row_idx + 1}"
                 elif col == "Timestamp" or col_lower in ["time", "timestamp", "date_time", "datetime"]:
-                    out_row[col] = minute_key + ":00"
+                    out_row[col] = bucket_key
                 elif col == "Date" or col_lower == "date":
-                    out_row[col] = _extract_date(minute_key)
-                elif col in group["_numeric_sums"] and group["_numeric_counts"].get(col, 0) > 0:
-                    avg_val = group["_numeric_sums"][col] / group["_numeric_counts"][col]
-                    out_row[col] = round(avg_val, 4)
+                    out_row[col] = _extract_date(bucket_key)
                 else:
+                    # First-value sampling: no aggregation, preserve the raw value
                     out_row[col] = first_row.get(col, "")
-            
+
             writer.writerow(out_row)
-            
+
             preview.append(out_row)
             row_idx += 1
 

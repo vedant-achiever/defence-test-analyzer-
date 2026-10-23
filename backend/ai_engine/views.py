@@ -18,7 +18,7 @@ from .telemetry_engine import (
     get_workspace,
     combine_datasets,
     calculate_statistics,
-    generate_minute_averaged_csv,
+    generate_30s_averaged_csv,
 )
 
 from django.conf import settings
@@ -50,6 +50,17 @@ def _save_chat_history(messages):
 def index_view(request):
     """Serve the single-file HTML frontend."""
     return render(request, "index.html")
+
+
+@require_http_methods(["GET"])
+def favicon(request):
+    """Serve a minimal inline SVG favicon.
+
+    Avoids 404 noise in logs from browsers requesting /favicon.ico when no
+    favicon.ico file exists in the project.
+    """
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#0ea5e9"/></svg>'
+    return HttpResponse(svg, content_type="image/svg+xml")
 
 
 @csrf_exempt
@@ -180,7 +191,7 @@ def upload_telemetry(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def combine_telemetry(request):
-    """Trigger data combination, generate minute-averaged CSV, and return stats."""
+    """Trigger data combination, generate 30-second sampled CSV, and return stats."""
     try:
         workspace = get_workspace(request.session.session_key)
         workspace.combined_data = combine_datasets(workspace.files, workspace.config)
@@ -188,9 +199,9 @@ def combine_telemetry(request):
         master_csv_path = MASTER_COMBINED_CSV
         averaged_csv_path = MASTER_AVERAGED_CSV
         
-        # Generate minute-averaged CSV with Date column
+        # Generate 30-second sampled CSV with Date column
         sort_order = 'asc'
-        averaged_preview = generate_minute_averaged_csv(
+        averaged_preview = generate_30s_averaged_csv(
             master_csv_path, averaged_csv_path, sort_order
         )
         
@@ -201,7 +212,7 @@ def combine_telemetry(request):
         preview_data = workspace.combined_data[:100] if workspace.combined_data else []
         record_count = sum(f.get("rowCount", 0) for f in workspace.files)
         
-        # Count averaged rows
+        # Count sampled (30-second) rows
         averaged_count = len(averaged_preview)
         if os.path.exists(averaged_csv_path):
             with open(averaged_csv_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -223,7 +234,7 @@ def combine_telemetry(request):
 @csrf_exempt
 @require_http_methods(["GET"])
 def averaged_data(request):
-    """Return minute-averaged data with sort order control."""
+    """Return 30-second sampled data with sort order control."""
     try:
         master_csv_path = MASTER_COMBINED_CSV
         averaged_csv_path = MASTER_AVERAGED_CSV
@@ -233,11 +244,11 @@ def averaged_data(request):
         
         sort_order = request.GET.get('sort', 'asc')
         
-        averaged_preview = generate_minute_averaged_csv(
+        averaged_preview = generate_30s_averaged_csv(
             master_csv_path, averaged_csv_path, sort_order
         )
         
-        # Count total averaged rows
+        # Count total sampled rows
         averaged_count = 0
         if os.path.exists(averaged_csv_path):
             with open(averaged_csv_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -279,7 +290,7 @@ def raw_data(request):
 
 @require_http_methods(["GET"])
 def export_telemetry(request):
-    """Export raw or minute-averaged CSV data."""
+    """Export raw or 30-second sampled CSV data."""
     try:
         export_format = request.GET.get('format', 'raw')
         
@@ -297,7 +308,7 @@ def export_telemetry(request):
             response['Content-Disposition'] = 'attachment; filename="master_telemetry_raw.csv"'
             return response
 
-        # Averaged format — use the pre-generated averaged CSV
+        # Sampled (every 30 seconds) format — use the pre-generated sampled CSV
         averaged_csv_path = MASTER_AVERAGED_CSV
         
         if not os.path.exists(averaged_csv_path):
@@ -305,7 +316,7 @@ def export_telemetry(request):
             master_csv_path = MASTER_COMBINED_CSV
             if not os.path.exists(master_csv_path):
                 return HttpResponse("No data to export. Combine data first.", status=400)
-            generate_minute_averaged_csv(master_csv_path, averaged_csv_path, 'asc')
+            generate_30s_averaged_csv(master_csv_path, averaged_csv_path, 'asc')
         
         def iter_csv(path):
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -313,7 +324,7 @@ def export_telemetry(request):
                     yield line
         
         response = StreamingHttpResponse(iter_csv(averaged_csv_path), content_type='text/csv')
-        response['Content-Disposition'] = 'attachment; filename="master_telemetry_minute_averaged.csv"'
+        response['Content-Disposition'] = 'attachment; filename="master_telemetry_30s.csv"'
         return response
         
     except Exception as e:

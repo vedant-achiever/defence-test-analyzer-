@@ -11,12 +11,12 @@ urlpatterns = [
     path('upload/', views.upload_telemetry, name='upload_telemetry_slash'),
     path('combine', views.combine_telemetry, name='combine_telemetry'),
     path('combine/', views.combine_telemetry, name='combine_telemetry_slash'),
-    path('export', views.export_telemetry, name='export_telemetry'),
-    path('export/', views.export_telemetry, name='export_telemetry_slash'),
     path('averaged-data', views.averaged_data, name='averaged_data'),
     path('averaged-data/', views.averaged_data, name='averaged_data_slash'),
-    path('raw-data', views.raw_data, name='raw_data'),
-    path('raw-data/', views.raw_data, name='raw_data_slash'),
+    
+    # Export endpoints (raw / 30-second sampled CSV download)
+    path('export', views.export_telemetry, name='export_telemetry'),
+    path('export/', views.export_telemetry, name='export_telemetry_slash'),
     
     # Existing AI endpoints
     path('gemini/analyze', views.analyze_telemetry, name='analyze_telemetry'),
